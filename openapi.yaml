@@ -1,0 +1,19 @@
+swagger: '2.0'
+info:
+  title: mdr API
+  version: 1.0.0
+paths:
+  /api/mrd:
+    get:
+      x-google-backend:
+        address: https://REGION-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/PROJECT_ID/services/mdr-service
+      operationId: getMdr
+      responses:
+        '200':
+          description: A successful response
+      security:
+        - {}
+host: api.example.com
+x-google-endpoints:
+  - name: api.example.com
+    target: API_GATEWAY_IP
