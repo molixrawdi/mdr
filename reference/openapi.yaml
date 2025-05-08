@@ -1,0 +1,55 @@
+swagger: '2.0'
+info:
+  title: mdr API
+  version: 1.0.0
+host: api.example.com
+x-google-endpoints:
+  - name: api.example.com
+
+schemes:
+  - https
+
+paths:
+  /api/mrd:
+    get:
+      operationId: getMdr
+      responses:
+        '200':
+          description: A successful response
+      x-google-backend:
+        address: https://REGION-run.googleapis.com/apis/serving.knative.dev/v1/namespaces/PROJECT_ID/services/mdr-service
+      security:
+        - {}
+      x-google-quota:
+        metricCosts:
+          myapi/requests: 1
+
+x-google-quota:
+  limits:
+    # Per-minute per project
+    - name: perMinutePerProject
+      metric: myapi/requests
+      unit: "1/min/{project}"
+      values:
+        STANDARD: 60
+
+    # Per-day per project
+    - name: perDayPerProject
+      metric: myapi/requests
+      unit: "1/day/{project}"
+      values:
+        STANDARD: 1000
+
+    # Per-day per user
+    - name: perDayPerUser
+      metric: myapi/requests
+      unit: "1/day/{user}"
+      values:
+        STANDARD: 500
+
+    # Per-minute per IP address
+    - name: perMinutePerIp
+      metric: myapi/requests
+      unit: "1/min/{ip}"
+      values:
+        STANDARD: 10
