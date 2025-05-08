@@ -1,0 +1,257 @@
+steps:
+  # Step 1: Generate a unique image tag similar to GitHub Actions
+  - name: 'gcr.io/cloud-builders/bash'
+    id: 'generate-image-tag'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        echo "IMAGE_TAG=$COMMIT_SHA-$BUILD_ID" > /workspace/env_vars
+        cat /workspace/env_vars
+    env:
+      - 'COMMIT_SHA=$COMMIT_SHA'
+      - 'BUILD_ID=$BUILD_ID'
+
+  # Step 2: Load the environment variables
+  - name: 'gcr.io/cloud-builders/bash'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        source /workspace/env_vars
+        echo "Using image tag: $IMAGE_TAG"
+        # Export for subsequent steps
+        echo "IMAGE_TAG=$IMAGE_TAG" >> /workspace/env_vars
+
+  # Step 3: Build the Docker image with Buildx-like caching capabilities
+  - name: 'gcr.io/kaniko-project/executor:latest'
+    args:
+      - '--destination=gcr.io/$PROJECT_ID/mdr-service:$BUILD_ID'
+      - '--destination=gcr.io/$PROJECT_ID/mdr-service:latest'
+      - '--cache=true'
+      - '--cache-ttl=24h'
+      - '--context=.'
+      - '--dockerfile=./Dockerfile'
+
+  # Step 4: Deploy to Cloud Run
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'gcloud'
+    args:
+      - 'run'
+      - 'deploy'
+      - 'mdr-service'
+      - '--image=gcr.io/$PROJECT_ID/mdr-service:$BUILD_ID'
+      - '--region=us-central1'
+      - '--platform=managed'
+      - '--allow-unauthenticated'
+
+  # Step 5: Deploy API Gateway configuration
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        # Create API Gateway spec file
+        cat > openapi.yaml << 'EOL'
+        swagger: '2.0'
+        info:
+          title: MDR API Gateway
+          description: API Gateway for MDR Service
+          version: 1.0.0
+        schemes:
+          - https
+        produces:
+          - application/json
+        paths:
+          /api/mrd:
+            get:
+              summary: MDR service endpoint
+              operationId: mdr-service
+              x-google-backend:
+                address: https://${_CLOUD_RUN_URL}
+              responses:
+                '200':
+                  description: OK
+            post:
+              summary: MDR service endpoint
+              operationId: mdr-service-post
+              x-google-backend:
+                address: https://${_CLOUD_RUN_URL}
+              responses:
+                '200':
+                  description: OK
+        EOL
+        
+        # Get the Cloud Run URL
+        export CLOUD_RUN_URL=$(gcloud run services describe mdr-service --region=us-central1 --format='value(status.url)' | sed 's/https:\/\///')
+        
+        # Replace placeholder in spec
+        sed -i "s/\${_CLOUD_RUN_URL}/$CLOUD_RUN_URL/g" openapi.yaml
+        
+        # Create or update API
+        API_ID="mdr-api"
+        if ! gcloud api-gateway apis describe $API_ID --project=$PROJECT_ID 2>/dev/null; then
+          gcloud api-gateway apis create $API_ID --project=$PROJECT_ID
+        fi
+        
+        # Create new API config
+        CONFIG_ID="mdr-api-config-$(date +%Y%m%d%H%M%S)"
+        gcloud api-gateway api-configs create $CONFIG_ID \
+          --api=$API_ID \
+          --openapi-spec=openapi.yaml \
+          --project=$PROJECT_ID \
+          --backend-auth-service-account=YOUR_SERVICE_ACCOUNT@$PROJECT_ID.iam.gserviceaccount.com
+        
+        # Create or update gateway
+        GATEWAY_ID="mdr-gateway"
+        REGION="us-central1"
+        if ! gcloud api-gateway gateways describe $GATEWAY_ID --location=$REGION --project=$PROJECT_ID 2>/dev/null; then
+          gcloud api-gateway gateways create $GATEWAY_ID \
+            --api=$API_ID \
+            --api-config=$CONFIG_ID \
+            --location=$REGION \
+            --project=$PROJECT_ID
+        else
+          gcloud api-gateway gateways update $GATEWAY_ID \
+            --api-config=$CONFIG_ID \
+            --location=$REGION \
+            --project=$PROJECT_ID
+        fi
+
+  # Step 6: Set up Load Balancer (using Terraform in Cloud Build)
+  - name: 'hashicorp/terraform:latest'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        cd /workspace/lb-config
+        
+        # Create Terraform configuration for the load balancer
+        cat > main.tf << 'EOL'
+        provider "google" {
+          project = "${PROJECT_ID}"
+          region  = "us-central1"
+        }
+
+        # Load Balancer with external IP
+        resource "google_compute_global_address" "mdr_lb_ip" {
+          name = "mdr-lb-ip"
+        }
+
+        # Create HTTPS certificate
+        resource "google_compute_managed_ssl_certificate" "mdr_cert" {
+          name = "mdr-ssl-cert"
+          managed {
+            domains = ["example.com"]  # Replace with your actual domain
+          }
+        }
+
+        # HTTP to HTTPS redirect
+        resource "google_compute_url_map" "https_redirect" {
+          name = "mdr-https-redirect"
+
+          default_url_redirect {
+            https_redirect         = true
+            redirect_response_code = "MOVED_PERMANENTLY_DEFAULT"
+            strip_query            = false
+          }
+        }
+
+        # HTTP Target Proxy
+        resource "google_compute_target_http_proxy" "http_proxy" {
+          name    = "mdr-http-proxy"
+          url_map = google_compute_url_map.https_redirect.id
+        }
+
+        # HTTP Forwarding Rule
+        resource "google_compute_global_forwarding_rule" "http_forwarding_rule" {
+          name       = "mdr-http-rule"
+          target     = google_compute_target_http_proxy.http_proxy.id
+          port_range = "80"
+          ip_address = google_compute_global_address.mdr_lb_ip.address
+        }
+
+        # Get API Gateway hostname
+        data "google_api_gateway_gateway" "mdr_gateway" {
+          gateway_id = "mdr-gateway"
+          region     = "us-central1"
+        }
+
+        # Network Endpoint Group for API Gateway
+        resource "google_compute_global_network_endpoint_group" "api_gateway_neg" {
+          name                  = "mdr-api-gateway-neg"
+          network_endpoint_type = "INTERNET_FQDN_PORT"
+          default_port          = 443
+        }
+
+        # Network endpoint for API Gateway
+        resource "google_compute_global_network_endpoint" "api_gateway_endpoint" {
+          global_network_endpoint_group = google_compute_global_network_endpoint_group.api_gateway_neg.name
+          fqdn                          = data.google_api_gateway_gateway.mdr_gateway.default_hostname
+          port                          = 443
+        }
+
+        # Backend service for API Gateway
+        resource "google_compute_backend_service" "api_gateway_backend" {
+          name        = "mdr-api-gateway-backend"
+          protocol    = "HTTPS"
+          timeout_sec = 30
+          enable_cdn  = false
+
+          backend {
+            group = google_compute_global_network_endpoint_group.api_gateway_neg.id
+          }
+        }
+
+        # URL Map for HTTPS
+        resource "google_compute_url_map" "url_map" {
+          name            = "mdr-url-map"
+          default_service = google_compute_backend_service.api_gateway_backend.id
+
+          host_rule {
+            hosts        = ["example.com"]  # Replace with your actual domain
+            path_matcher = "mdr-paths"
+          }
+
+          path_matcher {
+            name            = "mdr-paths"
+            default_service = google_compute_backend_service.api_gateway_backend.id
+
+            path_rule {
+              paths   = ["/api/example.com/api/mrd", "/api/example.com/api/mrd/*"]
+              service = google_compute_backend_service.api_gateway_backend.id
+            }
+          }
+        }
+
+        # HTTPS Target Proxy
+        resource "google_compute_target_https_proxy" "https_proxy" {
+          name             = "mdr-https-proxy"
+          url_map          = google_compute_url_map.url_map.id
+          ssl_certificates = [google_compute_managed_ssl_certificate.mdr_cert.id]
+        }
+
+        # HTTPS Forwarding Rule
+        resource "google_compute_global_forwarding_rule" "https_forwarding_rule" {
+          name       = "mdr-https-rule"
+          target     = google_compute_target_https_proxy.https_proxy.id
+          port_range = "443"
+          ip_address = google_compute_global_address.mdr_lb_ip.address
+        }
+
+        # Outputs
+        output "load_balancer_ip" {
+          value = google_compute_global_address.mdr_lb_ip.address
+        }
+        EOL
+
+        # Initialize and apply Terraform
+        terraform init
+        terraform apply -auto-approve
+
+substitutions:
+  _SERVICE_NAME: mdr-service
+  _REGION: us-central1
+
+options:
+  logging: CLOUD_LOGGING_ONLY
